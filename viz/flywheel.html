@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flywheel viewer</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#e9eeec;--panel:#f7f9f8;--ink:#10302e;--muted:#5d726f;--line:#c4d0cd;--brass:#b3832a;--sig:#c2412d;--rule:#d9e2df}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,sans-serif;display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr);grid-template-rows:auto 1fr;gap:16px;padding:16px;min-height:100vh}
+header{grid-column:1/-1;display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+h1{font-size:22px;font-weight:600;margin:0;letter-spacing:-.01em}
+header p{margin:0;color:var(--muted);max-width:60ch}
+#stage{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:6px;min-height:360px;overflow:hidden;touch-action:none;cursor:grab}
+#stage canvas{display:block;width:100%;height:100%}
+#hint{position:absolute;left:12px;bottom:10px;color:var(--muted);font-size:13px;pointer-events:none}
+aside{display:flex;flex-direction:column;gap:14px;min-width:0}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px}
+dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0;font-family:"IBM Plex Mono",ui-monospace,monospace}
+dt{color:var(--muted)}dd{margin:0;text-align:right;font-weight:500}
+#plot{width:100%;height:190px;display:block}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+button,label.btn{font:inherit;background:var(--ink);color:#fff;border:0;border-radius:4px;padding:7px 14px;cursor:pointer}
+button.alt,label.btn{background:transparent;color:var(--ink);border:1px solid var(--ink)}
+button:focus-visible,label.btn:focus-within,input:focus-visible{outline:3px solid var(--brass);outline-offset:2px}
+input[type=range]{width:100%;accent-color:var(--brass)}
+.ctl{display:grid;gap:2px;margin-bottom:10px}
+.ctl span{display:flex;justify-content:space-between;color:var(--muted);font-size:13px}
+#src{color:var(--muted);font-size:13px;margin:0}
+@media (max-width:820px){body{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Flywheel viewer</h1>
+  <p>Plays back a simulation or hardware CSV with columns t, targetRpm, rpm, volts. The model runs in your Java code; this page only draws its output.</p>
+</header>
+
+<div id="stage"><div id="hint">Drag to orbit, scroll to zoom</div></div>
+
+<aside>
+  <div class="box">
+    <div class="row">
+      <button id="play">Pause</button>
+      <label class="btn">Load CSV<input id="file" type="file" accept=".csv,text/csv" hidden></label>
+      <button id="demo" class="alt">Built-in demo</button>
+    </div>
+    <div class="ctl"><span><label for="seek">Time</label><b id="tlab">0.00 s</b></span><input id="seek" type="range" min="0" max="1000" value="0"></div>
+    <div class="ctl"><span><label for="vis">Display speed (fraction of real rotation)</label><b id="vlab">2%</b></span><input id="vis" type="range" min="1" max="100" value="2"></div>
+    <p id="src">Source: built-in demo (Java defaults, 3000 RPM target, load step at 1.5 s)</p>
+  </div>
+  <div class="box"><dl>
+    <dt>RPM</dt><dd id="rRpm">0</dd>
+    <dt>Target RPM</dt><dd id="rTgt">0</dd>
+    <dt>Error</dt><dd id="rErr">0</dd>
+    <dt>Voltage</dt><dd id="rVolt">0.00 V</dd>
+  </dl></div>
+  <div class="box"><canvas id="plot"></canvas></div>
+</aside>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+var rows=[],revs=[],tEnd=1,tNow=0,playing=true,last=performance.now();
+
+function demoData(){
+  var R=12/9.2,kT=0.3/9.2,kE=12/(6000*2*Math.PI/60),J=0.0002,kV=kE,kP=0.02,kI=0.1;
+  var w=0,integ=0,out=[],dt=0.02,sub=20,tgt=3000*2*Math.PI/60;
+  for(var i=0;i<=300;i++){
+    var t=i*dt,err=tgt-w;integ+=err*dt;
+    var v=Math.max(-12,Math.min(12,kV*tgt+kP*err+kI*integ)),load=t>=1.5?0.02:0;
+    out.push({t:t,tgt:3000,rpm:w*60/(2*Math.PI),volts:v});
+    for(var s=0;s<sub;s++){w+=((kT*(v-kE*w)/R)-load)/J*(dt/sub);}
+  }
+  return out;
+}
+
+function setData(d,label){
+  rows=d;revs=[0];
+  for(var i=1;i<d.length;i++){revs.push(revs[i-1]+(d[i].rpm+d[i-1].rpm)/2/60*(d[i].t-d[i-1].t));}
+  tEnd=d[d.length-1].t;tNow=0;
+  document.getElementById('src').textContent='Source: '+label;
+  drawPlot();
+}
+
+function parseCsv(text){
+  var lines=text.trim().split(/\r?\n/),h=lines[0].split(',').map(function(s){return s.trim().toLowerCase();});
+  var ci={t:h.indexOf('t'),g:h.indexOf('targetrpm'),r:h.indexOf('rpm'),v:h.indexOf('volts')};
+  if(ci.t<0||ci.r<0)return null;
+  var out=[];
+  for(var i=1;i<lines.length;i++){
+    var c=lines[i].split(',').map(Number);
+    if(isNaN(c[ci.t])||isNaN(c[ci.r]))continue;
+    out.push({t:c[ci.t],tgt:ci.g>=0?c[ci.g]:0,rpm:c[ci.r],volts:ci.v>=0?c[ci.v]:0});
+  }
+  return out.length>1?out:null;
+}
+
+function at(t){
+  if(t<=rows[0].t)return {r:rows[0],rev:revs[0]};
+  var lo=0,hi=rows.length-1;
+  while(hi-lo>1){var m=(lo+hi)>>1;if(rows[m].t<=t)lo=m;else hi=m;}
+  var a=rows[lo],b=rows[hi],f=(t-a.t)/(b.t-a.t||1);
+  return {r:{t:t,tgt:a.tgt+(b.tgt-a.tgt)*f,rpm:a.rpm+(b.rpm-a.rpm)*f,volts:a.volts+(b.volts-a.volts)*f},rev:revs[lo]+(revs[hi]-revs[lo])*f};
+}
+
+var stage=document.getElementById('stage');
+var renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+stage.appendChild(renderer.domElement);
+var scene=new THREE.Scene();scene.background=new THREE.Color(0xf7f9f8);
+var camera=new THREE.PerspectiveCamera(40,1,0.1,100);
+scene.add(new THREE.AmbientLight(0xffffff,0.65));
+var sun=new THREE.DirectionalLight(0xffffff,0.9);sun.position.set(3,5,4);scene.add(sun);
+
+var ink=new THREE.MeshStandardMaterial({color:0x10302e,metalness:0.3,roughness:0.55});
+var steel=new THREE.MeshStandardMaterial({color:0x9fb0ad,metalness:0.6,roughness:0.35});
+var brass=new THREE.MeshStandardMaterial({color:0xb3832a,metalness:0.5,roughness:0.4});
+var red=new THREE.MeshStandardMaterial({color:0xc2412d,roughness:0.5});
+
+var base=new THREE.Mesh(new THREE.BoxGeometry(5,0.2,2.4),ink);base.position.y=-1.6;scene.add(base);
+var motor=new THREE.Mesh(new THREE.CylinderGeometry(0.7,0.7,1.8,40),steel);
+motor.rotation.z=Math.PI/2;motor.position.set(-1.3,0,0);scene.add(motor);
+var mount=new THREE.Mesh(new THREE.BoxGeometry(1.4,0.5,1.0),ink);mount.position.set(-1.3,-1.25,0);scene.add(mount);
+
+var wheel=new THREE.Group();wheel.position.set(0.3,0,0);scene.add(wheel);
+var disk=new THREE.Mesh(new THREE.CylinderGeometry(1.2,1.2,0.35,64),brass);disk.rotation.z=Math.PI/2;wheel.add(disk);
+var rim=new THREE.Mesh(new THREE.TorusGeometry(1.2,0.07,16,64),ink);rim.rotation.y=Math.PI/2;wheel.add(rim);
+var hub=new THREE.Mesh(new THREE.CylinderGeometry(0.22,0.22,0.6,24),steel);hub.rotation.z=Math.PI/2;wheel.add(hub);
+for(var k=0;k<4;k++){
+  var bar=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.12,1.0),k===0?red:ink);
+  bar.rotation.x=k*Math.PI/2;bar.position.set(0,Math.sin(k*Math.PI/2)*-0.55,Math.cos(k*Math.PI/2)*0.55);
+  wheel.add(bar);
+}
+var shaft=new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.1,1.2,16),steel);shaft.rotation.z=Math.PI/2;shaft.position.set(-0.4,0,0);scene.add(shaft);
+
+var az=0.9,el=0.35,dist=9;
+function placeCam(){
+  camera.position.set(Math.sin(az)*Math.cos(el)*dist,Math.sin(el)*dist,Math.cos(az)*Math.cos(el)*dist);
+  camera.lookAt(0,-0.2,0);
+}
+var drag=false,px=0,py=0;
+stage.addEventListener('pointerdown',function(e){drag=true;px=e.clientX;py=e.clientY;stage.setPointerCapture(e.pointerId);stage.style.cursor='grabbing';});
+stage.addEventListener('pointerup',function(){drag=false;stage.style.cursor='grab';});
+stage.addEventListener('pointermove',function(e){
+  if(!drag)return;
+  az-=(e.clientX-px)*0.008;el=Math.max(-0.2,Math.min(1.3,el+(e.clientY-py)*0.006));px=e.clientX;py=e.clientY;
+});
+stage.addEventListener('wheel',function(e){e.preventDefault();dist=Math.max(4,Math.min(16,dist+e.deltaY*0.01));},{passive:false});
+
+function resize(){
+  var w=stage.clientWidth,h=stage.clientHeight;
+  renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();drawPlot();
+}
+window.addEventListener('resize',resize);
+
+var plot=document.getElementById('plot'),pc=plot.getContext('2d');
+function drawPlot(){
+  var w=plot.clientWidth,h=plot.clientHeight,dpr=devicePixelRatio||1;
+  plot.width=w*dpr;plot.height=h*dpr;pc.setTransform(dpr,0,0,dpr,0,0);pc.clearRect(0,0,w,h);
+  if(!rows.length)return;
+  var m={l:44,r:8,t:8,b:22},pw=w-m.l-m.r,ph=h-m.t-m.b,ymax=0;
+  rows.forEach(function(r){ymax=Math.max(ymax,r.rpm,r.tgt);});ymax=Math.ceil(ymax*1.1/500)*500||500;
+  var X=function(t){return m.l+(t-rows[0].t)/(tEnd-rows[0].t||1)*pw;},Y=function(v){return m.t+ph-v/ymax*ph;};
+  pc.strokeStyle='#d9e2df';pc.fillStyle='#5d726f';pc.font='11px "IBM Plex Mono",monospace';pc.lineWidth=1;
+  for(var g=0;g<=4;g++){var v=ymax*g/4;pc.beginPath();pc.moveTo(m.l,Y(v));pc.lineTo(w-m.r,Y(v));pc.stroke();pc.fillText(Math.round(v),4,Y(v)+4);}
+  pc.fillText('t (s)',w-m.r-34,h-6);
+  pc.setLineDash([5,4]);pc.strokeStyle='#c2412d';pc.beginPath();
+  rows.forEach(function(r,i){i?pc.lineTo(X(r.t),Y(r.tgt)):pc.moveTo(X(r.t),Y(r.tgt));});pc.stroke();pc.setLineDash([]);
+  pc.strokeStyle='#10302e';pc.lineWidth=2;pc.beginPath();
+  rows.forEach(function(r,i){i?pc.lineTo(X(r.t),Y(r.rpm)):pc.moveTo(X(r.t),Y(r.rpm));});pc.stroke();
+  pc.strokeStyle='#b3832a';pc.lineWidth=1.5;pc.beginPath();pc.moveTo(X(tNow),m.t);pc.lineTo(X(tNow),m.t+ph);pc.stroke();
+}
+
+var $=function(id){return document.getElementById(id);};
+function frame(now){
+  var dt=(now-last)/1000;last=now;
+  if(playing&&rows.length){tNow+=dt;if(tNow>tEnd)tNow=rows[0].t;}
+  if(rows.length){
+    var s=at(tNow),vis=$('vis').value/100;
+    wheel.rotation.x=-s.rev*2*Math.PI*vis;
+    $('rRpm').textContent=s.r.rpm.toFixed(0);$('rTgt').textContent=s.r.tgt.toFixed(0);
+    $('rErr').textContent=(s.r.tgt-s.r.rpm).toFixed(0);$('rVolt').textContent=s.r.volts.toFixed(2)+' V';
+    $('tlab').textContent=tNow.toFixed(2)+' s';$('seek').value=Math.round((tNow-rows[0].t)/(tEnd-rows[0].t||1)*1000);
+    $('vlab').textContent=$('vis').value+'%';
+    drawPlot();
+  }
+  placeCam();renderer.render(scene,camera);requestAnimationFrame(frame);
+}
+
+$('play').onclick=function(){playing=!playing;this.textContent=playing?'Pause':'Play';};
+$('seek').oninput=function(){tNow=rows[0].t+this.value/1000*(tEnd-rows[0].t);};
+$('demo').onclick=function(){setData(demoData(),'built-in demo (Java defaults, 3000 RPM target, load step at 1.5 s)');};
+$('file').onchange=function(){
+  var f=this.files[0];if(!f)return;
+  var fr=new FileReader();
+  fr.onload=function(){
+    var d=parseCsv(fr.result);
+    if(d)setData(d,f.name);else $('src').textContent='Could not read '+f.name+'. Expected a header with t, targetRpm, rpm, volts.';
+  };
+  fr.readAsText(f);
+};
+
+setData(demoData(),'built-in demo (Java defaults, 3000 RPM target, load step at 1.5 s)');
+resize();requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
